@@ -1,0 +1,2603 @@
+#pragma kernel CSBuildVertices
+#pragma kernel CSMergeBoundaryVertices
+#pragma kernel CSBuildXFaces
+#pragma kernel CSBuildYFaces
+#pragma kernel CSBuildZFaces
+#pragma kernel CSCopyChunk
+
+#pragma kernel CSBuildSeamVertices
+#pragma kernel CSBuildSeamEdges
+
+
+#include "Lib/DC_Vertices.hlsl"
+#include "Lib/DC_Faces.hlsl"
+
+
+// ============================================================
+// BUILD VERTICES
+// ============================================================
+
+[numthreads(8, 8, 8)]
+void CSBuildVertices(
+    uint3 id : SV_DispatchThreadID)
+{
+    DC_BuildVertex(id);
+}
+
+
+// ============================================================
+// LOD BOUNDARY MERGE
+// ============================================================
+
+void DecodeMergeCellIndex(
+    uint index,
+    out int x,
+    out int y,
+    out int z)
+{
+    uint rowSize =
+        (uint) CellCount *
+        (uint) CellCount;
+
+    z =
+        (int) (
+            index /
+            rowSize
+        );
+
+    uint remainder =
+        index %
+        rowSize;
+
+    y =
+        (int) (
+            remainder /
+            (uint) CellCount
+        );
+
+    x =
+        (int) (
+            remainder %
+            (uint) CellCount
+        );
+}
+
+
+float3 GetCellCenterFromIndex(
+    uint index)
+{
+    int x;
+    int y;
+    int z;
+
+    DecodeMergeCellIndex(
+        index,
+        x,
+        y,
+        z
+    );
+
+    return
+        Origin +
+        (
+            float3(
+                x,
+                y,
+                z
+            )
+            +
+            float3(
+                0.5f,
+                0.5f,
+                0.5f
+            )
+        )
+        *
+        Step;
+}
+
+
+float3 GetCellMinFromIndex(
+    uint index)
+{
+    int x;
+    int y;
+    int z;
+
+    DecodeMergeCellIndex(
+        index,
+        x,
+        y,
+        z
+    );
+
+    return
+        Origin +
+        float3(
+            x,
+            y,
+            z
+        )
+        *
+        Step;
+}
+
+
+float3 GetCellMaxFromIndex(
+    uint index)
+{
+    return
+        GetCellMinFromIndex(
+            index
+        )
+        +
+        float3(
+            Step,
+            Step,
+            Step
+        );
+}
+
+
+void AddTranslatedQef(
+    QefData source,
+    float3 sourceCenter,
+    float3 mergedCenter,
+
+    inout float a00,
+    inout float a01,
+    inout float a02,
+
+    inout float a11,
+    inout float a12,
+
+    inout float a22,
+
+    inout float b0,
+    inout float b1,
+    inout float b2,
+
+    inout float3 intersectionSum,
+
+    inout uint intersectionCount,
+
+    inout uint constraintCount)
+{
+    float3 delta =
+        mergedCenter -
+        sourceCenter;
+
+    a00 += source.A00;
+    a01 += source.A01;
+    a02 += source.A02;
+
+    a11 += source.A11;
+    a12 += source.A12;
+
+    a22 += source.A22;
+
+    float shiftedB0 =
+        source.B0
+        -
+        (
+            source.A00 * delta.x
+            +
+            source.A01 * delta.y
+            +
+            source.A02 * delta.z
+        );
+
+    float shiftedB1 =
+        source.B1
+        -
+        (
+            source.A01 * delta.x
+            +
+            source.A11 * delta.y
+            +
+            source.A12 * delta.z
+        );
+
+    float shiftedB2 =
+        source.B2
+        -
+        (
+            source.A02 * delta.x
+            +
+            source.A12 * delta.y
+            +
+            source.A22 * delta.z
+        );
+
+    b0 += shiftedB0;
+    b1 += shiftedB1;
+    b2 += shiftedB2;
+
+    intersectionSum +=
+        source.IntersectionSum;
+
+    intersectionCount +=
+        source.IntersectionCount;
+
+    constraintCount +=
+        source.ConstraintCount;
+}
+
+
+// ============================================================
+// MERGE GROUP
+// ============================================================
+
+[numthreads(64, 1, 1)]
+void CSMergeBoundaryVertices(
+    uint3 id : SV_DispatchThreadID)
+{
+    uint groupIndex =
+        id.x;
+
+    uint groupCount =
+        MergeGroupCountBuffer[
+            CounterSlot
+        ];
+
+    if (groupIndex >= groupCount)
+    {
+        return;
+    }
+
+    MergeGroup mergeGroup =
+        MergeGroupBuffer[
+            groupIndex
+        ];
+
+    uint member0 =
+        mergeGroup.Member0;
+
+    uint member1 =
+        mergeGroup.Member1;
+
+    uint member2 =
+        mergeGroup.Member2;
+
+    uint member3 =
+        mergeGroup.Member3;
+
+    bool valid0 =
+        VertexValid[
+            member0
+        ] != 0u;
+
+    bool valid1 =
+        VertexValid[
+            member1
+        ] != 0u;
+
+    bool valid2 =
+        VertexValid[
+            member2
+        ] != 0u;
+
+    bool valid3 =
+        VertexValid[
+            member3
+        ] != 0u;
+
+    if (!valid0 &&
+        !valid1 &&
+        !valid2 &&
+        !valid3)
+    {
+        return;
+    }
+
+
+    // ========================================================
+    // MERGED BOUNDS
+    // ========================================================
+
+    float3 mergedMin =
+        float3(
+            1e30f,
+            1e30f,
+            1e30f
+        );
+
+    float3 mergedMax =
+        float3(
+            -1e30f,
+            -1e30f,
+            -1e30f
+        );
+
+
+    if (valid0)
+    {
+        mergedMin =
+            min(
+                mergedMin,
+                GetCellMinFromIndex(
+                    member0
+                )
+            );
+
+        mergedMax =
+            max(
+                mergedMax,
+                GetCellMaxFromIndex(
+                    member0
+                )
+            );
+    }
+
+
+    if (valid1)
+    {
+        mergedMin =
+            min(
+                mergedMin,
+                GetCellMinFromIndex(
+                    member1
+                )
+            );
+
+        mergedMax =
+            max(
+                mergedMax,
+                GetCellMaxFromIndex(
+                    member1
+                )
+            );
+    }
+
+
+    if (valid2)
+    {
+        mergedMin =
+            min(
+                mergedMin,
+                GetCellMinFromIndex(
+                    member2
+                )
+            );
+
+        mergedMax =
+            max(
+                mergedMax,
+                GetCellMaxFromIndex(
+                    member2
+                )
+            );
+    }
+
+
+    if (valid3)
+    {
+        mergedMin =
+            min(
+                mergedMin,
+                GetCellMinFromIndex(
+                    member3
+                )
+            );
+
+        mergedMax =
+            max(
+                mergedMax,
+                GetCellMaxFromIndex(
+                    member3
+                )
+            );
+    }
+
+
+    float3 mergedCenter =
+        (
+            mergedMin +
+            mergedMax
+        )
+        *
+        0.5f;
+
+
+    // ========================================================
+    // MERGED QEF
+    // ========================================================
+
+    float a00 = 0.0f;
+    float a01 = 0.0f;
+    float a02 = 0.0f;
+
+    float a11 = 0.0f;
+    float a12 = 0.0f;
+
+    float a22 = 0.0f;
+
+    float b0 = 0.0f;
+    float b1 = 0.0f;
+    float b2 = 0.0f;
+
+    float3 intersectionSum =
+        float3(
+            0.0f,
+            0.0f,
+            0.0f
+        );
+
+    uint intersectionCount =
+        0u;
+
+    uint constraintCount =
+        0u;
+
+
+    if (valid0)
+    {
+        AddTranslatedQef(
+            QefDataBuffer[
+                member0
+            ],
+
+            GetCellCenterFromIndex(
+                member0
+            ),
+
+            mergedCenter,
+
+            a00,
+            a01,
+            a02,
+
+            a11,
+            a12,
+
+            a22,
+
+            b0,
+            b1,
+            b2,
+
+            intersectionSum,
+
+            intersectionCount,
+
+            constraintCount
+        );
+    }
+
+
+    if (valid1)
+    {
+        AddTranslatedQef(
+            QefDataBuffer[
+                member1
+            ],
+
+            GetCellCenterFromIndex(
+                member1
+            ),
+
+            mergedCenter,
+
+            a00,
+            a01,
+            a02,
+
+            a11,
+            a12,
+
+            a22,
+
+            b0,
+            b1,
+            b2,
+
+            intersectionSum,
+
+            intersectionCount,
+
+            constraintCount
+        );
+    }
+
+
+    if (valid2)
+    {
+        AddTranslatedQef(
+            QefDataBuffer[
+                member2
+            ],
+
+            GetCellCenterFromIndex(
+                member2
+            ),
+
+            mergedCenter,
+
+            a00,
+            a01,
+            a02,
+
+            a11,
+            a12,
+
+            a22,
+
+            b0,
+            b1,
+            b2,
+
+            intersectionSum,
+
+            intersectionCount,
+
+            constraintCount
+        );
+    }
+
+
+    if (valid3)
+    {
+        AddTranslatedQef(
+            QefDataBuffer[
+                member3
+            ],
+
+            GetCellCenterFromIndex(
+                member3
+            ),
+
+            mergedCenter,
+
+            a00,
+            a01,
+            a02,
+
+            a11,
+            a12,
+
+            a22,
+
+            b0,
+            b1,
+            b2,
+
+            intersectionSum,
+
+            intersectionCount,
+
+            constraintCount
+        );
+    }
+
+
+    if (intersectionCount == 0u)
+    {
+        return;
+    }
+
+
+    // ========================================================
+    // SOLVE
+    // ========================================================
+
+    float3 localSolution =
+        float3(
+            0.0f,
+            0.0f,
+            0.0f
+        );
+
+    bool solved =
+        false;
+
+
+    if (constraintCount > 0u)
+    {
+        solved =
+            SolveQEF(
+                a00,
+                a01,
+                a02,
+
+                a11,
+                a12,
+
+                a22,
+
+                b0,
+                b1,
+                b2,
+
+                localSolution
+            );
+    }
+
+
+    float3 mergedVertex;
+
+
+    if (solved)
+    {
+        mergedVertex =
+            mergedCenter +
+            localSolution;
+    }
+    else
+    {
+        mergedVertex =
+            intersectionSum /
+            (float) intersectionCount;
+    }
+
+
+    // ========================================================
+    // KEEP VERTEX INSIDE MERGED REGION
+    // ========================================================
+
+    bool outside =
+        mergedVertex.x < mergedMin.x ||
+        mergedVertex.x > mergedMax.x ||
+        mergedVertex.y < mergedMin.y ||
+        mergedVertex.y > mergedMax.y ||
+        mergedVertex.z < mergedMin.z ||
+        mergedVertex.z > mergedMax.z;
+
+
+    if (outside)
+    {
+        mergedVertex =
+            intersectionSum /
+            (float) intersectionCount;
+    }
+
+
+    // ========================================================
+    // REPLACEMENT VERTEX
+    // ========================================================
+
+    uint replacementLocalIndex =
+        member0;
+
+
+    if (!valid0)
+    {
+        if (valid1)
+        {
+            replacementLocalIndex =
+                member1;
+        }
+        else if (valid2)
+        {
+            replacementLocalIndex =
+                member2;
+        }
+        else
+        {
+            replacementLocalIndex =
+                member3;
+        }
+    }
+
+
+    uint replacementCompactIndex =
+        VertexIndexBuffer[
+            replacementLocalIndex
+        ];
+
+
+    VertexBuffer[
+        replacementCompactIndex
+    ] =
+        mergedVertex;
+
+
+    float3 mergedNormal =
+        EstimateNormal(
+            mergedVertex
+        );
+
+
+    if (dot(
+            mergedNormal,
+            mergedNormal
+        ) < EPSILON)
+    {
+        mergedNormal =
+            float3(
+                0.0f,
+                1.0f,
+                0.0f
+            );
+    }
+    else
+    {
+        mergedNormal =
+            normalize(
+                mergedNormal
+            );
+    }
+
+
+    NormalBuffer[
+        replacementCompactIndex
+    ] =
+        mergedNormal;
+
+
+    // ========================================================
+    // ALIAS
+    // ========================================================
+
+    if (valid0)
+    {
+        VertexIndexBuffer[
+            member0
+        ] =
+            replacementCompactIndex;
+    }
+
+    if (valid1)
+    {
+        VertexIndexBuffer[
+            member1
+        ] =
+            replacementCompactIndex;
+    }
+
+    if (valid2)
+    {
+        VertexIndexBuffer[
+            member2
+        ] =
+            replacementCompactIndex;
+    }
+
+    if (valid3)
+    {
+        VertexIndexBuffer[
+            member3
+        ] =
+            replacementCompactIndex;
+    }
+}
+
+
+// ============================================================
+// BUILD X FACES
+// ============================================================
+
+[numthreads(8, 8, 8)]
+void CSBuildXFaces(
+    uint3 id : SV_DispatchThreadID)
+{
+    DC_BuildXFace(id);
+}
+
+
+// ============================================================
+// BUILD Y FACES
+// ============================================================
+
+[numthreads(8, 8, 8)]
+void CSBuildYFaces(
+    uint3 id : SV_DispatchThreadID)
+{
+    DC_BuildYFace(id);
+}
+
+
+// ============================================================
+// BUILD Z FACES
+// ============================================================
+
+[numthreads(8, 8, 8)]
+void CSBuildZFaces(
+    uint3 id : SV_DispatchThreadID)
+{
+    DC_BuildZFace(id);
+}
+
+
+// ============================================================
+// COPY COMPACT CHUNK
+// ============================================================
+
+StructuredBuffer<float3>
+CopySourceVertexBuffer;
+
+StructuredBuffer<float3>
+CopySourceNormalBuffer;
+
+StructuredBuffer<uint>
+CopySourceIndexBuffer;
+
+
+RWStructuredBuffer<float3>
+CopyDestinationVertexBuffer;
+
+RWStructuredBuffer<float3>
+CopyDestinationNormalBuffer;
+
+RWStructuredBuffer<uint>
+CopyDestinationIndexBuffer;
+
+
+int CopyVertexCount;
+int CopyIndexCount;
+
+int CopyVertexDestinationOffset;
+int CopyIndexDestinationOffset;
+
+
+[numthreads(64, 1, 1)]
+void CSCopyChunk(
+    uint3 id : SV_DispatchThreadID)
+{
+    uint index =
+        id.x;
+
+
+    if (index <
+        (uint) CopyVertexCount)
+    {
+        uint destinationIndex =
+            (uint) CopyVertexDestinationOffset +
+            index;
+
+
+        CopyDestinationVertexBuffer[
+            destinationIndex
+        ] =
+            CopySourceVertexBuffer[
+                index
+            ];
+
+
+        CopyDestinationNormalBuffer[
+            destinationIndex
+        ] =
+            CopySourceNormalBuffer[
+                index
+            ];
+    }
+
+
+    if (index <
+        (uint) CopyIndexCount)
+    {
+        uint destinationIndex =
+            (uint) CopyIndexDestinationOffset +
+            index;
+
+
+        CopyDestinationIndexBuffer[
+            destinationIndex
+        ] =
+            CopySourceIndexBuffer[
+                index
+            ];
+    }
+}
+
+
+// ============================================================
+// GPU SEAM DATA
+// ============================================================
+//
+// CPU supplies topology only.
+//
+// Density, Hermite intersections, normals and QEF are evaluated
+// here on the GPU using the same SampleDensity() implementation
+// as the normal chunk build.
+// ============================================================
+
+struct GpuSeamNodeData
+{
+    float3 Center;
+    float Size;
+    int Lod;
+    int Padding;
+};
+
+
+struct GpuSeamEdgeData
+{
+    uint Node0;
+    uint Node1;
+    uint Node2;
+    uint Node3;
+    uint Axis;
+};
+
+
+StructuredBuffer<GpuSeamNodeData>
+SeamNodeBuffer;
+
+
+StructuredBuffer<GpuSeamEdgeData>
+SeamEdgeBuffer;
+
+
+RWStructuredBuffer<float3>
+SeamVertexBuffer;
+
+
+RWStructuredBuffer<float3>
+SeamNormalBuffer;
+
+
+RWStructuredBuffer<uint>
+SeamVertexValidBuffer;
+
+
+RWStructuredBuffer<uint>
+SeamVertexIndexBuffer;
+
+
+RWStructuredBuffer<uint>
+SeamIndexBuffer;
+
+
+RWStructuredBuffer<uint>
+SeamVertexCountBuffer;
+
+
+RWStructuredBuffer<uint>
+SeamIndexCountBuffer;
+
+
+int SeamNodeCount;
+int SeamEdgeCount;
+
+
+// ============================================================
+// SEAM CORNERS
+// ============================================================
+
+static const uint SeamCorner0 = 0u;
+static const uint SeamCorner1 = 1u;
+static const uint SeamCorner2 = 2u;
+static const uint SeamCorner3 = 3u;
+static const uint SeamCorner4 = 4u;
+static const uint SeamCorner5 = 5u;
+static const uint SeamCorner6 = 6u;
+static const uint SeamCorner7 = 7u;
+
+
+float3 GetSeamCorner(
+    float3 minPoint,
+    float size,
+    uint corner)
+{
+    return
+        minPoint +
+        float3(
+            (corner & 1u) != 0u ? size : 0.0f,
+            (corner & 2u) != 0u ? size : 0.0f,
+            (corner & 4u) != 0u ? size : 0.0f
+        );
+}
+
+
+// ============================================================
+// SEAM EDGE ACCUMULATE CONSTRAINT
+// ============================================================
+
+void AccumulateSeamConstraint(
+    float3 localPoint,
+    float3 normal,
+
+    inout float a00,
+    inout float a01,
+    inout float a02,
+
+    inout float a11,
+    inout float a12,
+
+    inout float a22,
+
+    inout float b0,
+    inout float b1,
+    inout float b2,
+
+    inout float3 intersectionSum,
+
+    inout uint intersectionCount,
+
+    inout uint constraintCount)
+{
+    float nx =
+        normal.x;
+
+    float ny =
+        normal.y;
+
+    float nz =
+        normal.z;
+
+
+    a00 +=
+        nx * nx;
+
+    a01 +=
+        nx * ny;
+
+    a02 +=
+        nx * nz;
+
+    a11 +=
+        ny * ny;
+
+    a12 +=
+        ny * nz;
+
+    a22 +=
+        nz * nz;
+
+
+    float planeValue =
+        dot(
+            normal,
+            localPoint
+        );
+
+
+    b0 +=
+        nx *
+        planeValue;
+
+    b1 +=
+        ny *
+        planeValue;
+
+    b2 +=
+        nz *
+        planeValue;
+
+
+    intersectionSum +=
+        localPoint;
+
+
+    intersectionCount++;
+
+    constraintCount++;
+}
+
+
+// ============================================================
+// SEAM BUILD NODE QEF
+// ============================================================
+
+void BuildSeamNodeVertex(
+    GpuSeamNodeData node,
+    out float3 vertex,
+    out float3 normal,
+    out bool valid)
+{
+    float size =
+        node.Size;
+
+
+    float3 minPoint =
+        node.Center -
+        float3(
+            size,
+            size,
+            size
+        )
+        *
+        0.5f;
+
+
+    float d0 =
+        SampleDensity(
+            GetSeamCorner(
+                minPoint,
+                size,
+                0u
+            )
+        );
+
+    float d1 =
+        SampleDensity(
+            GetSeamCorner(
+                minPoint,
+                size,
+                1u
+            )
+        );
+
+    float d2 =
+        SampleDensity(
+            GetSeamCorner(
+                minPoint,
+                size,
+                2u
+            )
+        );
+
+    float d3 =
+        SampleDensity(
+            GetSeamCorner(
+                minPoint,
+                size,
+                3u
+            )
+        );
+
+    float d4 =
+        SampleDensity(
+            GetSeamCorner(
+                minPoint,
+                size,
+                4u
+            )
+        );
+
+    float d5 =
+        SampleDensity(
+            GetSeamCorner(
+                minPoint,
+                size,
+                5u
+            )
+        );
+
+    float d6 =
+        SampleDensity(
+            GetSeamCorner(
+                minPoint,
+                size,
+                6u
+            )
+        );
+
+    float d7 =
+        SampleDensity(
+            GetSeamCorner(
+                minPoint,
+                size,
+                7u
+            )
+        );
+
+
+    float a00 = 0.0f;
+    float a01 = 0.0f;
+    float a02 = 0.0f;
+
+    float a11 = 0.0f;
+    float a12 = 0.0f;
+
+    float a22 = 0.0f;
+
+    float b0 = 0.0f;
+    float b1 = 0.0f;
+    float b2 = 0.0f;
+
+
+    float3 intersectionSum =
+        float3(
+            0.0f,
+            0.0f,
+            0.0f
+        );
+
+
+    uint intersectionCount =
+        0u;
+
+
+    uint constraintCount =
+        0u;
+
+
+    // --------------------------------------------------------
+    // X edges
+    // --------------------------------------------------------
+
+    if (IsSignChange(d0, d1))
+    {
+        float t =
+            d0 /
+            (d0 - d1);
+
+
+        float3 p =
+            lerp(
+                GetSeamCorner(
+                    minPoint,
+                    size,
+                    0u
+                ),
+                GetSeamCorner(
+                    minPoint,
+                    size,
+                    1u
+                ),
+                t
+            );
+
+
+        float3 n =
+            EstimateNormal(p);
+
+
+        AccumulateSeamConstraint(
+            p - node.Center,
+            n,
+
+            a00,
+            a01,
+            a02,
+
+            a11,
+            a12,
+
+            a22,
+
+            b0,
+            b1,
+            b2,
+
+            intersectionSum,
+            intersectionCount,
+            constraintCount
+        );
+    }
+
+
+    if (IsSignChange(d2, d3))
+    {
+        float t =
+            d2 /
+            (d2 - d3);
+
+
+        float3 p =
+            lerp(
+                GetSeamCorner(
+                    minPoint,
+                    size,
+                    2u
+                ),
+                GetSeamCorner(
+                    minPoint,
+                    size,
+                    3u
+                ),
+                t
+            );
+
+
+        float3 n =
+            EstimateNormal(p);
+
+
+        AccumulateSeamConstraint(
+            p - node.Center,
+            n,
+
+            a00,
+            a01,
+            a02,
+
+            a11,
+            a12,
+
+            a22,
+
+            b0,
+            b1,
+            b2,
+
+            intersectionSum,
+            intersectionCount,
+            constraintCount
+        );
+    }
+
+
+    if (IsSignChange(d4, d5))
+    {
+        float t =
+            d4 /
+            (d4 - d5);
+
+
+        float3 p =
+            lerp(
+                GetSeamCorner(
+                    minPoint,
+                    size,
+                    4u
+                ),
+                GetSeamCorner(
+                    minPoint,
+                    size,
+                    5u
+                ),
+                t
+            );
+
+
+        float3 n =
+            EstimateNormal(p);
+
+
+        AccumulateSeamConstraint(
+            p - node.Center,
+            n,
+
+            a00,
+            a01,
+            a02,
+
+            a11,
+            a12,
+
+            a22,
+
+            b0,
+            b1,
+            b2,
+
+            intersectionSum,
+            intersectionCount,
+            constraintCount
+        );
+    }
+
+
+    if (IsSignChange(d6, d7))
+    {
+        float t =
+            d6 /
+            (d6 - d7);
+
+
+        float3 p =
+            lerp(
+                GetSeamCorner(
+                    minPoint,
+                    size,
+                    6u
+                ),
+                GetSeamCorner(
+                    minPoint,
+                    size,
+                    7u
+                ),
+                t
+            );
+
+
+        float3 n =
+            EstimateNormal(p);
+
+
+        AccumulateSeamConstraint(
+            p - node.Center,
+            n,
+
+            a00,
+            a01,
+            a02,
+
+            a11,
+            a12,
+
+            a22,
+
+            b0,
+            b1,
+            b2,
+
+            intersectionSum,
+            intersectionCount,
+            constraintCount
+        );
+    }
+
+
+    // --------------------------------------------------------
+    // Y edges
+    // --------------------------------------------------------
+
+    if (IsSignChange(d0, d2))
+    {
+        float t =
+            d0 /
+            (d0 - d2);
+
+
+        float3 p =
+            lerp(
+                GetSeamCorner(
+                    minPoint,
+                    size,
+                    0u
+                ),
+                GetSeamCorner(
+                    minPoint,
+                    size,
+                    2u
+                ),
+                t
+            );
+
+
+        float3 n =
+            EstimateNormal(p);
+
+
+        AccumulateSeamConstraint(
+            p - node.Center,
+            n,
+
+            a00,
+            a01,
+            a02,
+
+            a11,
+            a12,
+
+            a22,
+
+            b0,
+            b1,
+            b2,
+
+            intersectionSum,
+            intersectionCount,
+            constraintCount
+        );
+    }
+
+
+    if (IsSignChange(d1, d3))
+    {
+        float t =
+            d1 /
+            (d1 - d3);
+
+
+        float3 p =
+            lerp(
+                GetSeamCorner(
+                    minPoint,
+                    size,
+                    1u
+                ),
+                GetSeamCorner(
+                    minPoint,
+                    size,
+                    3u
+                ),
+                t
+            );
+
+
+        float3 n =
+            EstimateNormal(p);
+
+
+        AccumulateSeamConstraint(
+            p - node.Center,
+            n,
+
+            a00,
+            a01,
+            a02,
+
+            a11,
+            a12,
+
+            a22,
+
+            b0,
+            b1,
+            b2,
+
+            intersectionSum,
+            intersectionCount,
+            constraintCount
+        );
+    }
+
+
+    if (IsSignChange(d4, d6))
+    {
+        float t =
+            d4 /
+            (d4 - d6);
+
+
+        float3 p =
+            lerp(
+                GetSeamCorner(
+                    minPoint,
+                    size,
+                    4u
+                ),
+                GetSeamCorner(
+                    minPoint,
+                    size,
+                    6u
+                ),
+                t
+            );
+
+
+        float3 n =
+            EstimateNormal(p);
+
+
+        AccumulateSeamConstraint(
+            p - node.Center,
+            n,
+
+            a00,
+            a01,
+            a02,
+
+            a11,
+            a12,
+
+            a22,
+
+            b0,
+            b1,
+            b2,
+
+            intersectionSum,
+            intersectionCount,
+            constraintCount
+        );
+    }
+
+
+    if (IsSignChange(d5, d7))
+    {
+        float t =
+            d5 /
+            (d5 - d7);
+
+
+        float3 p =
+            lerp(
+                GetSeamCorner(
+                    minPoint,
+                    size,
+                    5u
+                ),
+                GetSeamCorner(
+                    minPoint,
+                    size,
+                    7u
+                ),
+                t
+            );
+
+
+        float3 n =
+            EstimateNormal(p);
+
+
+        AccumulateSeamConstraint(
+            p - node.Center,
+            n,
+
+            a00,
+            a01,
+            a02,
+
+            a11,
+            a12,
+
+            a22,
+
+            b0,
+            b1,
+            b2,
+
+            intersectionSum,
+            intersectionCount,
+            constraintCount
+        );
+    }
+
+
+    // --------------------------------------------------------
+    // Z edges
+    // --------------------------------------------------------
+
+    if (IsSignChange(d0, d4))
+    {
+        float t =
+            d0 /
+            (d0 - d4);
+
+
+        float3 p =
+            lerp(
+                GetSeamCorner(
+                    minPoint,
+                    size,
+                    0u
+                ),
+                GetSeamCorner(
+                    minPoint,
+                    size,
+                    4u
+                ),
+                t
+            );
+
+
+        float3 n =
+            EstimateNormal(p);
+
+
+        AccumulateSeamConstraint(
+            p - node.Center,
+            n,
+
+            a00,
+            a01,
+            a02,
+
+            a11,
+            a12,
+
+            a22,
+
+            b0,
+            b1,
+            b2,
+
+            intersectionSum,
+            intersectionCount,
+            constraintCount
+        );
+    }
+
+
+    if (IsSignChange(d1, d5))
+    {
+        float t =
+            d1 /
+            (d1 - d5);
+
+
+        float3 p =
+            lerp(
+                GetSeamCorner(
+                    minPoint,
+                    size,
+                    1u
+                ),
+                GetSeamCorner(
+                    minPoint,
+                    size,
+                    5u
+                ),
+                t
+            );
+
+
+        float3 n =
+            EstimateNormal(p);
+
+
+        AccumulateSeamConstraint(
+            p - node.Center,
+            n,
+
+            a00,
+            a01,
+            a02,
+
+            a11,
+            a12,
+
+            a22,
+
+            b0,
+            b1,
+            b2,
+
+            intersectionSum,
+            intersectionCount,
+            constraintCount
+        );
+    }
+
+
+    if (IsSignChange(d2, d6))
+    {
+        float t =
+            d2 /
+            (d2 - d6);
+
+
+        float3 p =
+            lerp(
+                GetSeamCorner(
+                    minPoint,
+                    size,
+                    2u
+                ),
+                GetSeamCorner(
+                    minPoint,
+                    size,
+                    6u
+                ),
+                t
+            );
+
+
+        float3 n =
+            EstimateNormal(p);
+
+
+        AccumulateSeamConstraint(
+            p - node.Center,
+            n,
+
+            a00,
+            a01,
+            a02,
+
+            a11,
+            a12,
+
+            a22,
+
+            b0,
+            b1,
+            b2,
+
+            intersectionSum,
+            intersectionCount,
+            constraintCount
+        );
+    }
+
+
+    if (IsSignChange(d3, d7))
+    {
+        float t =
+            d3 /
+            (d3 - d7);
+
+
+        float3 p =
+            lerp(
+                GetSeamCorner(
+                    minPoint,
+                    size,
+                    3u
+                ),
+                GetSeamCorner(
+                    minPoint,
+                    size,
+                    7u
+                ),
+                t
+            );
+
+
+        float3 n =
+            EstimateNormal(p);
+
+
+        AccumulateSeamConstraint(
+            p - node.Center,
+            n,
+
+            a00,
+            a01,
+            a02,
+
+            a11,
+            a12,
+
+            a22,
+
+            b0,
+            b1,
+            b2,
+
+            intersectionSum,
+            intersectionCount,
+            constraintCount
+        );
+    }
+
+
+    // --------------------------------------------------------
+    // No surface in node.
+    // --------------------------------------------------------
+
+    if (intersectionCount == 0u)
+    {
+        valid =
+            false;
+
+
+        vertex =
+            float3(
+                0.0f,
+                0.0f,
+                0.0f
+            );
+
+
+        normal =
+            float3(
+                0.0f,
+                1.0f,
+                0.0f
+            );
+
+
+        return;
+    }
+
+
+    // ========================================================
+    // QEF SOLVE
+    // ========================================================
+
+    float3 localSolution =
+        float3(
+            0.0f,
+            0.0f,
+            0.0f
+        );
+
+
+    bool solved =
+        false;
+
+
+    if (constraintCount > 0u)
+    {
+        solved =
+            SolveQEF(
+                a00,
+                a01,
+                a02,
+
+                a11,
+                a12,
+
+                a22,
+
+                b0,
+                b1,
+                b2,
+
+                localSolution
+            );
+    }
+
+
+    if (solved)
+    {
+        vertex =
+            node.Center +
+            localSolution;
+    }
+    else
+    {
+        vertex =
+            node.Center +
+            (
+                intersectionSum /
+                (float) intersectionCount
+            );
+    }
+
+
+    // ========================================================
+    // CLAMP TO NODE
+    // ========================================================
+
+    float3 nodeMax =
+        minPoint +
+        float3(
+            size,
+            size,
+            size
+        );
+
+
+    vertex =
+        clamp(
+            vertex,
+            minPoint,
+            nodeMax
+        );
+
+
+    normal =
+        EstimateNormal(
+            vertex
+        );
+
+
+    if (dot(
+            normal,
+            normal
+        ) < EPSILON)
+    {
+        normal =
+            float3(
+                0.0f,
+                1.0f,
+                0.0f
+            );
+    }
+    else
+    {
+        normal =
+            normalize(
+                normal
+            );
+    }
+
+
+    valid =
+        true;
+}
+
+
+// ============================================================
+// BUILD SEAM VERTICES
+// ============================================================
+
+[numthreads(64, 1, 1)]
+void CSBuildSeamVertices(
+    uint3 id : SV_DispatchThreadID)
+{
+    uint nodeIndex =
+        id.x;
+
+
+    // IMPORTANT:
+    // Counters are cleared by the CPU before Dispatch().
+    // Do not clear them here, otherwise thread 0 races against
+    // other threads performing InterlockedAdd().
+
+
+    if (nodeIndex >=
+        (uint) SeamNodeCount)
+    {
+        return;
+    }
+
+
+    GpuSeamNodeData node =
+        SeamNodeBuffer[
+            nodeIndex
+        ];
+
+
+    float3 vertex;
+    float3 normal;
+    bool valid;
+
+
+    BuildSeamNodeVertex(
+        node,
+        vertex,
+        normal,
+        valid
+    );
+
+
+    if (!valid)
+    {
+        SeamVertexValidBuffer[
+            nodeIndex
+        ] =
+            0u;
+
+        return;
+    }
+
+
+    uint compactIndex;
+
+
+    InterlockedAdd(
+        SeamVertexCountBuffer[0],
+        1u,
+        compactIndex
+    );
+
+
+    SeamVertexBuffer[
+        compactIndex
+    ] =
+        vertex;
+
+
+    SeamNormalBuffer[
+        compactIndex
+    ] =
+        normal;
+
+
+    SeamVertexIndexBuffer[
+        nodeIndex
+    ] =
+        compactIndex;
+
+
+    SeamVertexValidBuffer[
+        nodeIndex
+    ] =
+        1u;
+}
+
+
+// ============================================================
+// SEAM PROCESS EDGE MASK
+// ============================================================
+//
+// Exact reference processEdgeMask:
+//
+// X = {3,2,1,0}
+// Y = {7,5,6,4}
+// Z = {11,10,9,8}
+//
+// The four entries correspond to the four nodes around a
+// contour edge.
+// ============================================================
+
+uint GetSeamProcessEdge(
+    uint axis,
+    uint nodeQuadrant)
+{
+    if (axis == 0u)
+    {
+        if (nodeQuadrant == 0u)
+            return 3u;
+        if (nodeQuadrant == 1u)
+            return 2u;
+        if (nodeQuadrant == 2u)
+            return 1u;
+        return 0u;
+    }
+
+
+    if (axis == 1u)
+    {
+        if (nodeQuadrant == 0u)
+            return 7u;
+        if (nodeQuadrant == 1u)
+            return 5u;
+        if (nodeQuadrant == 2u)
+            return 6u;
+        return 4u;
+    }
+
+
+    if (nodeQuadrant == 0u)
+        return 11u;
+    if (nodeQuadrant == 1u)
+        return 10u;
+    if (nodeQuadrant == 2u)
+        return 9u;
+    return 8u;
+}
+
+
+// ============================================================
+// SEAM EDGE -> CORNERS
+// ============================================================
+//
+// Edge numbering:
+//
+// 0..3  = X edges
+// 4..7  = Y edges
+// 8..11 = Z edges
+//
+// Same cube-edge ordering used by the seam vertex construction.
+// ============================================================
+
+void GetSeamEdgeCornerPair(
+    uint edge,
+    out uint c0,
+    out uint c1)
+{
+    if (edge == 0u)
+    {
+        c0 = 0u;
+        c1 = 1u;
+        return;
+    }
+
+    if (edge == 1u)
+    {
+        c0 = 2u;
+        c1 = 3u;
+        return;
+    }
+
+    if (edge == 2u)
+    {
+        c0 = 4u;
+        c1 = 5u;
+        return;
+    }
+
+    if (edge == 3u)
+    {
+        c0 = 6u;
+        c1 = 7u;
+        return;
+    }
+
+
+    if (edge == 4u)
+    {
+        c0 = 0u;
+        c1 = 2u;
+        return;
+    }
+
+    if (edge == 5u)
+    {
+        c0 = 1u;
+        c1 = 3u;
+        return;
+    }
+
+    if (edge == 6u)
+    {
+        c0 = 4u;
+        c1 = 6u;
+        return;
+    }
+
+    if (edge == 7u)
+    {
+        c0 = 5u;
+        c1 = 7u;
+        return;
+    }
+
+
+    if (edge == 8u)
+    {
+        c0 = 0u;
+        c1 = 4u;
+        return;
+    }
+
+    if (edge == 9u)
+    {
+        c0 = 1u;
+        c1 = 5u;
+        return;
+    }
+
+    if (edge == 10u)
+    {
+        c0 = 2u;
+        c1 = 6u;
+        return;
+    }
+
+
+    c0 = 3u;
+    c1 = 7u;
+}
+
+
+// ============================================================
+// SAMPLE SMALLEST NODE EDGE
+// ============================================================
+//
+// IMPORTANT:
+//
+// The sign test for a mixed-LOD contour edge must use the
+// edge belonging to the smallest of the four leaf nodes.
+// ============================================================
+
+void SampleSeamNodeEdge(
+    GpuSeamNodeData node,
+    uint edge,
+    out float d0,
+    out float d1)
+{
+    float size =
+        node.Size;
+
+
+    float3 minPoint =
+        node.Center -
+        float3(
+            size,
+            size,
+            size
+        )
+        *
+        0.5f;
+
+
+    uint c0;
+    uint c1;
+
+
+    GetSeamEdgeCornerPair(
+        edge,
+        c0,
+        c1
+    );
+
+
+    d0 =
+        SampleDensity(
+            GetSeamCorner(
+                minPoint,
+                size,
+                c0
+            )
+        );
+
+
+    d1 =
+        SampleDensity(
+            GetSeamCorner(
+                minPoint,
+                size,
+                c1
+            )
+        );
+}
+
+
+// ============================================================
+// SEAM QUAD
+// ============================================================
+//
+// Reference ContourProcessEdge ordering:
+//
+// !flip:
+//     0,1,3
+//     0,3,2
+//
+// flip:
+//     0,3,1
+//     0,2,3
+// ============================================================
+
+void AddSeamQuad(
+    uint node0,
+    uint node1,
+    uint node2,
+    uint node3,
+    float d0,
+    float d1,
+    bool flip)
+{
+    if (!IsSignChange(
+            d0,
+            d1
+        ))
+    {
+        return;
+    }
+
+
+    if (SeamVertexValidBuffer[node0] == 0u ||
+        SeamVertexValidBuffer[node1] == 0u ||
+        SeamVertexValidBuffer[node2] == 0u ||
+        SeamVertexValidBuffer[node3] == 0u)
+    {
+        return;
+    }
+
+
+    uint v0 =
+        SeamVertexIndexBuffer[
+            node0
+        ];
+
+    uint v1 =
+        SeamVertexIndexBuffer[
+            node1
+        ];
+
+    uint v2 =
+        SeamVertexIndexBuffer[
+            node2
+        ];
+
+    uint v3 =
+        SeamVertexIndexBuffer[
+            node3
+        ];
+
+
+    uint indexOffset;
+
+
+    InterlockedAdd(
+        SeamIndexCountBuffer[0],
+        6u,
+        indexOffset
+    );
+
+
+    if (!flip)
+    {
+        SeamIndexBuffer[
+            indexOffset + 0u
+        ] =
+            v0;
+
+        SeamIndexBuffer[
+            indexOffset + 1u
+        ] =
+            v1;
+
+        SeamIndexBuffer[
+            indexOffset + 2u
+        ] =
+            v3;
+
+
+        SeamIndexBuffer[
+            indexOffset + 3u
+        ] =
+            v0;
+
+        SeamIndexBuffer[
+            indexOffset + 4u
+        ] =
+            v3;
+
+        SeamIndexBuffer[
+            indexOffset + 5u
+        ] =
+            v2;
+    }
+    else
+    {
+        SeamIndexBuffer[
+            indexOffset + 0u
+        ] =
+            v0;
+
+        SeamIndexBuffer[
+            indexOffset + 1u
+        ] =
+            v3;
+
+        SeamIndexBuffer[
+            indexOffset + 2u
+        ] =
+            v1;
+
+
+        SeamIndexBuffer[
+            indexOffset + 3u
+        ] =
+            v0;
+
+        SeamIndexBuffer[
+            indexOffset + 4u
+        ] =
+            v2;
+
+        SeamIndexBuffer[
+            indexOffset + 5u
+        ] =
+            v3;
+    }
+}
+
+
+// ============================================================
+// BUILD SEAM EDGES
+// ============================================================
+
+[numthreads(64, 1, 1)]
+void CSBuildSeamEdges(
+    uint3 id : SV_DispatchThreadID)
+{
+    uint edgeIndex =
+        id.x;
+
+
+    if (edgeIndex >=
+        (uint) SeamEdgeCount)
+    {
+        return;
+    }
+
+
+    GpuSeamEdgeData edge =
+        SeamEdgeBuffer[
+            edgeIndex
+        ];
+
+
+    if (edge.Node0 >=
+            (uint) SeamNodeCount ||
+        edge.Node1 >=
+            (uint) SeamNodeCount ||
+        edge.Node2 >=
+            (uint) SeamNodeCount ||
+        edge.Node3 >=
+            (uint) SeamNodeCount)
+    {
+        return;
+    }
+
+
+    GpuSeamNodeData n0 =
+        SeamNodeBuffer[
+            edge.Node0
+        ];
+
+    GpuSeamNodeData n1 =
+        SeamNodeBuffer[
+            edge.Node1
+        ];
+
+    GpuSeamNodeData n2 =
+        SeamNodeBuffer[
+            edge.Node2
+        ];
+
+    GpuSeamNodeData n3 =
+        SeamNodeBuffer[
+            edge.Node3
+        ];
+
+
+    // ========================================================
+    // FIND SMALLEST LEAF
+    // ========================================================
+
+    uint minNode =
+        0u;
+
+    float minSize =
+        n0.Size;
+
+
+    if (n1.Size < minSize)
+    {
+        minSize =
+            n1.Size;
+
+        minNode =
+            1u;
+    }
+
+
+    if (n2.Size < minSize)
+    {
+        minSize =
+            n2.Size;
+
+        minNode =
+            2u;
+    }
+
+
+    if (n3.Size < minSize)
+    {
+        minSize =
+            n3.Size;
+
+        minNode =
+            3u;
+    }
+
+
+    // ========================================================
+    // GET PROCESS EDGE FOR SMALLEST NODE
+    // ========================================================
+
+    uint processEdge =
+        GetSeamProcessEdge(
+            edge.Axis,
+            minNode
+        );
+
+
+    // ========================================================
+    // SELECT SMALLEST NODE
+    // ========================================================
+
+    GpuSeamNodeData minNodeData =
+        n0;
+
+
+    if (minNode == 1u)
+    {
+        minNodeData =
+            n1;
+    }
+    else if (minNode == 2u)
+    {
+        minNodeData =
+            n2;
+    }
+    else if (minNode == 3u)
+    {
+        minNodeData =
+            n3;
+    }
+
+
+    // ========================================================
+    // SIGN TEST ON SMALLEST NODE'S ACTUAL EDGE
+    // ========================================================
+
+    float d0;
+    float d1;
+
+
+    SampleSeamNodeEdge(
+        minNodeData,
+        processEdge,
+        d0,
+        d1
+    );
+
+
+    if (!IsSignChange(
+            d0,
+            d1
+        ))
+    {
+        return;
+    }
+
+
+    // ========================================================
+    // REFERENCE FLIP RULE
+    // ========================================================
+    //
+    // Reference:
+    //
+    // flip = m1 != MATERIAL_AIR
+    //
+    // Our density convention:
+    //
+    // negative = inside
+    // positive = outside
+    //
+    // therefore the second endpoint being non-negative means
+    // the winding must be flipped.
+    // ========================================================
+
+    bool flip =
+        d1 >= 0.0f;
+
+
+    // ========================================================
+    // EMIT CROSS-CHUNK QUAD
+    // ========================================================
+
+    AddSeamQuad(
+        edge.Node0,
+        edge.Node1,
+        edge.Node2,
+        edge.Node3,
+        d0,
+        d1,
+        flip
+    );
+}

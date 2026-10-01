@@ -1,0 +1,1997 @@
+﻿#pragma kernel CSBuildVertices
+#pragma kernel CSBuildXFaces
+#pragma kernel CSBuildYFaces
+#pragma kernel CSBuildZFaces
+
+#include "Noise/TerrainNoisePerlin.hlsl"
+
+
+// ============================================================
+// PARAMETERS
+// ============================================================
+
+int CellCount;
+
+float3 Origin;
+float Step;
+
+float3 PlanetCenter;
+float PlanetRadius;
+
+int NoiseSeed;
+float NoiseFrequency;
+float NoiseHeight;
+
+
+// ============================================================
+// BUFFERS
+// ============================================================
+
+// One slot per voxel cell.
+// Vertex index == flattened cell index.
+RWStructuredBuffer<float3> VertexBuffer;
+
+// One normal per vertex.
+RWStructuredBuffer<float3> NormalBuffer;
+
+// 0 = no vertex
+// 1 = valid vertex
+RWStructuredBuffer<uint> VertexValid;
+
+// Number of valid vertices.
+RWStructuredBuffer<uint> VertexCountBuffer;
+
+// Fixed index buffer.
+// Every quad occupies 6 consecutive indices.
+RWStructuredBuffer<uint> IndexBuffer;
+
+// Number of generated indices.
+RWStructuredBuffer<uint> IndexCountBuffer;
+
+
+// ============================================================
+// CONSTANTS
+// ============================================================
+
+static const float EPSILON = 0.000001f;
+
+
+// ============================================================
+// CELL INDEX
+// ============================================================
+
+uint GetVertexIndex(
+    int x,
+    int y,
+    int z)
+{
+    return
+        (uint) (
+            x +
+            CellCount *
+            (
+                y +
+                CellCount * z
+            )
+        );
+}
+
+
+// ============================================================
+// SIGN CHANGE
+// ============================================================
+
+bool IsSignChange(
+    float a,
+    float b)
+{
+    return
+        (a < 0.0f && b >= 0.0f) ||
+        (a >= 0.0f && b < 0.0f);
+}
+
+
+// ============================================================
+// DENSITY
+// ============================================================
+
+float SampleDensity(
+    float3 position)
+{
+    float sphereDensity =
+        distance(
+            position,
+            PlanetCenter
+        )
+        -
+        PlanetRadius;
+
+
+    // Fast path.
+    // This also means NoiseHeight = 0
+    // really disables noise calculations.
+    if (NoiseHeight == 0.0f)
+    {
+        return sphereDensity;
+    }
+
+
+    float3 direction =
+        normalize(
+            position -
+            PlanetCenter
+        );
+
+
+    float noiseValue =
+        TerrainNoisePerlin3D(
+            direction,
+            NoiseFrequency,
+            (uint) NoiseSeed
+        );
+
+
+    return
+        sphereDensity -
+        noiseValue *
+        NoiseHeight;
+}
+
+
+// ============================================================
+// NORMAL
+//
+// Same finite-difference approach as CPU.
+//
+// h = max(step * 0.25, 0.001)
+// ============================================================
+
+float3 EstimateNormal(
+    float3 position)
+{
+    float h =
+        max(
+            Step * 0.25f,
+            0.001f
+        );
+
+
+    float dx =
+        SampleDensity(
+            position +
+            float3(
+                h,
+                0.0f,
+                0.0f
+            )
+        )
+        -
+        SampleDensity(
+            position -
+            float3(
+                h,
+                0.0f,
+                0.0f
+            )
+        );
+
+
+    float dy =
+        SampleDensity(
+            position +
+            float3(
+                0.0f,
+                h,
+                0.0f
+            )
+        )
+        -
+        SampleDensity(
+            position -
+            float3(
+                0.0f,
+                h,
+                0.0f
+            )
+        );
+
+
+    float dz =
+        SampleDensity(
+            position +
+            float3(
+                0.0f,
+                0.0f,
+                h
+            )
+        )
+        -
+        SampleDensity(
+            position -
+            float3(
+                0.0f,
+                0.0f,
+                h
+            )
+        );
+
+
+    float3 normal =
+        float3(
+            dx,
+            dy,
+            dz
+        );
+
+
+    if (dot(normal, normal) < EPSILON)
+    {
+        return float3(
+            0.0f,
+            1.0f,
+            0.0f
+        );
+    }
+
+
+    return normalize(
+        normal
+    );
+}
+
+
+// ============================================================
+// QEF CONSTRAINT
+// ============================================================
+
+void AccumulateConstraint(
+    float3 positionA,
+    float densityA,
+    float3 positionB,
+    float densityB,
+    float3 cellCenter,
+
+    inout int intersectionCount,
+    inout int constraintCount,
+
+    inout float3 intersectionSum,
+    inout float3 constraintPointSum,
+
+    inout float a00,
+    inout float a01,
+    inout float a02,
+
+    inout float a11,
+    inout float a12,
+
+    inout float a22,
+
+    inout float b0,
+    inout float b1,
+    inout float b2)
+{
+    if (!IsSignChange(
+        densityA,
+        densityB))
+    {
+        return;
+    }
+
+
+    float denominator =
+        densityA -
+        densityB;
+
+
+    if (abs(denominator) < EPSILON)
+    {
+        return;
+    }
+
+
+    float t =
+        densityA /
+        denominator;
+
+
+    t =
+        clamp(
+            t,
+            0.0f,
+            1.0f
+        );
+
+
+    float3 intersection =
+        lerp(
+            positionA,
+            positionB,
+            t
+        );
+
+
+    // Keep the same intersection statistics
+    // as CPU DualContouringMesher.
+    intersectionSum +=
+        intersection;
+
+    intersectionCount++;
+
+
+    float3 normal =
+        EstimateNormal(
+            intersection
+        );
+
+
+    if (dot(normal, normal) < EPSILON)
+    {
+        return;
+    }
+
+
+    normal =
+        normalize(
+            normal
+        );
+
+
+    float3 localPoint =
+        intersection -
+        cellCenter;
+
+
+    // Same local point used by CPU QEF solver.
+    constraintPointSum +=
+        localPoint;
+
+    constraintCount++;
+
+
+    // --------------------------------------------------------
+    // ATA
+    // --------------------------------------------------------
+
+    a00 +=
+        normal.x *
+        normal.x;
+
+
+    a01 +=
+        normal.x *
+        normal.y;
+
+
+    a02 +=
+        normal.x *
+        normal.z;
+
+
+    a11 +=
+        normal.y *
+        normal.y;
+
+
+    a12 +=
+        normal.y *
+        normal.z;
+
+
+    a22 +=
+        normal.z *
+        normal.z;
+
+
+    // --------------------------------------------------------
+    // ATB
+    // --------------------------------------------------------
+
+    float d =
+        dot(
+            normal,
+            localPoint
+        );
+
+
+    b0 +=
+        normal.x *
+        d;
+
+
+    b1 +=
+        normal.y *
+        d;
+
+
+    b2 +=
+        normal.z *
+        d;
+}
+
+
+// ============================================================
+// QEF SOLVER
+//
+// Gaussian elimination with partial pivoting.
+// Matches CPU QefSolver structure.
+// ============================================================
+
+bool SolveQEF(
+    float a00,
+    float a01,
+    float a02,
+
+    float a11,
+    float a12,
+
+    float a22,
+
+    float b0,
+    float b1,
+    float b2,
+
+    out float3 result)
+{
+    float4 row0 =
+        float4(
+            a00,
+            a01,
+            a02,
+            b0
+        );
+
+
+    float4 row1 =
+        float4(
+            a01,
+            a11,
+            a12,
+            b1
+        );
+
+
+    float4 row2 =
+        float4(
+            a02,
+            a12,
+            a22,
+            b2
+        );
+
+
+    // ========================================================
+    // COLUMN 0
+    // ========================================================
+
+    float pivot0 =
+        abs(row0.x);
+
+    float pivot1 =
+        abs(row1.x);
+
+    float pivot2 =
+        abs(row2.x);
+
+
+    if (pivot1 > pivot0 &&
+        pivot1 >= pivot2)
+    {
+        float4 temp =
+            row0;
+
+        row0 =
+            row1;
+
+        row1 =
+            temp;
+
+        pivot0 =
+            pivot1;
+    }
+    else if (pivot2 > pivot0 &&
+             pivot2 > pivot1)
+    {
+        float4 temp =
+            row0;
+
+        row0 =
+            row2;
+
+        row2 =
+            temp;
+
+        pivot0 =
+            pivot2;
+    }
+
+
+    if (pivot0 < EPSILON)
+    {
+        result =
+            float3(
+                0.0f,
+                0.0f,
+                0.0f
+            );
+
+        return false;
+    }
+
+
+    float divisor =
+        row0.x;
+
+
+    row0 /=
+        divisor;
+
+
+    float factor1 =
+        row1.x;
+
+
+    row1 -=
+        factor1 *
+        row0;
+
+
+    float factor2 =
+        row2.x;
+
+
+    row2 -=
+        factor2 *
+        row0;
+
+
+    // ========================================================
+    // COLUMN 1
+    // ========================================================
+
+    float secondPivot0 =
+        abs(row1.y);
+
+    float secondPivot1 =
+        abs(row2.y);
+
+
+    if (secondPivot1 > secondPivot0)
+    {
+        float4 temp =
+            row1;
+
+        row1 =
+            row2;
+
+        row2 =
+            temp;
+
+        secondPivot0 =
+            secondPivot1;
+    }
+
+
+    if (secondPivot0 < EPSILON)
+    {
+        result =
+            float3(
+                0.0f,
+                0.0f,
+                0.0f
+            );
+
+        return false;
+    }
+
+
+    divisor =
+        row1.y;
+
+
+    row1 /=
+        divisor;
+
+
+    factor1 =
+        row0.y;
+
+
+    row0 -=
+        factor1 *
+        row1;
+
+
+    factor2 =
+        row2.y;
+
+
+    row2 -=
+        factor2 *
+        row1;
+
+
+    // ========================================================
+    // COLUMN 2
+    // ========================================================
+
+    float thirdPivot =
+        abs(row2.z);
+
+
+    if (thirdPivot < EPSILON)
+    {
+        result =
+            float3(
+                0.0f,
+                0.0f,
+                0.0f
+            );
+
+        return false;
+    }
+
+
+    divisor =
+        row2.z;
+
+
+    row2 /=
+        divisor;
+
+
+    factor1 =
+        row0.z;
+
+
+    row0 -=
+        factor1 *
+        row2;
+
+
+    factor2 =
+        row1.z;
+
+
+    row1 -=
+        factor2 *
+        row2;
+
+
+    // ========================================================
+    // RESULT
+    // ========================================================
+
+    result =
+        float3(
+            row0.w,
+            row1.w,
+            row2.w
+        );
+
+
+    return true;
+}
+
+
+// ============================================================
+// ADD QUAD
+// ============================================================
+
+void AddQuad(
+    uint a,
+    uint b,
+    uint c,
+    uint d,
+
+    bool validA,
+    bool validB,
+    bool validC,
+    bool validD,
+
+    float da,
+    float db,
+
+    bool baseNormalMatchesPositiveAxis)
+{
+    if (!validA ||
+        !validB ||
+        !validC ||
+        !validD)
+    {
+        return;
+    }
+
+
+    bool insideToOutside =
+        da < 0.0f &&
+        db >= 0.0f;
+
+
+    bool reverse =
+        insideToOutside !=
+        baseNormalMatchesPositiveAxis;
+
+
+    uint baseIndex =
+        0u;
+
+
+    // Reserve six consecutive indices.
+    InterlockedAdd(
+        IndexCountBuffer[0],
+        6u,
+        baseIndex
+    );
+
+
+    if (reverse)
+    {
+        // a c b
+        // a d c
+
+        IndexBuffer[
+            baseIndex + 0u
+        ] =
+            a;
+
+
+        IndexBuffer[
+            baseIndex + 1u
+        ] =
+            c;
+
+
+        IndexBuffer[
+            baseIndex + 2u
+        ] =
+            b;
+
+
+        IndexBuffer[
+            baseIndex + 3u
+        ] =
+            a;
+
+
+        IndexBuffer[
+            baseIndex + 4u
+        ] =
+            d;
+
+
+        IndexBuffer[
+            baseIndex + 5u
+        ] =
+            c;
+    }
+    else
+    {
+        // a b c
+        // a c d
+
+        IndexBuffer[
+            baseIndex + 0u
+        ] =
+            a;
+
+
+        IndexBuffer[
+            baseIndex + 1u
+        ] =
+            b;
+
+
+        IndexBuffer[
+            baseIndex + 2u
+        ] =
+            c;
+
+
+        IndexBuffer[
+            baseIndex + 3u
+        ] =
+            a;
+
+
+        IndexBuffer[
+            baseIndex + 4u
+        ] =
+            c;
+
+
+        IndexBuffer[
+            baseIndex + 5u
+        ] =
+            d;
+    }
+}
+
+
+// ============================================================
+// BUILD VERTICES
+// ============================================================
+
+[numthreads(8, 8, 8)]
+void CSBuildVertices(
+    uint3 id : SV_DispatchThreadID)
+{
+    int x =
+        (int) id.x;
+
+    int y =
+        (int) id.y;
+
+    int z =
+        (int) id.z;
+
+
+    if (x >= CellCount ||
+        y >= CellCount ||
+        z >= CellCount)
+    {
+        return;
+    }
+
+
+    // ========================================================
+    // CORNERS
+    // ========================================================
+
+    float3 p0 =
+        Origin +
+        float3(
+            x,
+            y,
+            z
+        ) *
+        Step;
+
+
+    float3 p1 =
+        Origin +
+        float3(
+            x + 1,
+            y,
+            z
+        ) *
+        Step;
+
+
+    float3 p2 =
+        Origin +
+        float3(
+            x,
+            y + 1,
+            z
+        ) *
+        Step;
+
+
+    float3 p3 =
+        Origin +
+        float3(
+            x + 1,
+            y + 1,
+            z
+        ) *
+        Step;
+
+
+    float3 p4 =
+        Origin +
+        float3(
+            x,
+            y,
+            z + 1
+        ) *
+        Step;
+
+
+    float3 p5 =
+        Origin +
+        float3(
+            x + 1,
+            y,
+            z + 1
+        ) *
+        Step;
+
+
+    float3 p6 =
+        Origin +
+        float3(
+            x,
+            y + 1,
+            z + 1
+        ) *
+        Step;
+
+
+    float3 p7 =
+        Origin +
+        float3(
+            x + 1,
+            y + 1,
+            z + 1
+        ) *
+        Step;
+
+
+    // ========================================================
+    // DENSITIES
+    // ========================================================
+
+    float d0 =
+        SampleDensity(
+            p0
+        );
+
+
+    float d1 =
+        SampleDensity(
+            p1
+        );
+
+
+    float d2 =
+        SampleDensity(
+            p2
+        );
+
+
+    float d3 =
+        SampleDensity(
+            p3
+        );
+
+
+    float d4 =
+        SampleDensity(
+            p4
+        );
+
+
+    float d5 =
+        SampleDensity(
+            p5
+        );
+
+
+    float d6 =
+        SampleDensity(
+            p6
+        );
+
+
+    float d7 =
+        SampleDensity(
+            p7
+        );
+
+
+    // ========================================================
+    // INSIDE / OUTSIDE
+    // ========================================================
+
+    bool hasInside =
+        d0 < 0.0f ||
+        d1 < 0.0f ||
+        d2 < 0.0f ||
+        d3 < 0.0f ||
+        d4 < 0.0f ||
+        d5 < 0.0f ||
+        d6 < 0.0f ||
+        d7 < 0.0f;
+
+
+    bool hasOutside =
+        d0 >= 0.0f ||
+        d1 >= 0.0f ||
+        d2 >= 0.0f ||
+        d3 >= 0.0f ||
+        d4 >= 0.0f ||
+        d5 >= 0.0f ||
+        d6 >= 0.0f ||
+        d7 >= 0.0f;
+
+
+    if (!hasInside ||
+        !hasOutside)
+    {
+        return;
+    }
+
+
+    // ========================================================
+    // CELL CENTER
+    // ========================================================
+
+    float3 cellCenter =
+        Origin +
+        (
+            float3(
+                x,
+                y,
+                z
+            )
+            +
+            float3(
+                0.5f,
+                0.5f,
+                0.5f
+            )
+        )
+        *
+        Step;
+
+
+    // ========================================================
+    // QEF ACCUMULATORS
+    // ========================================================
+
+    int intersectionCount =
+        0;
+
+
+    int constraintCount =
+        0;
+
+
+    float3 intersectionSum =
+        float3(
+            0.0f,
+            0.0f,
+            0.0f
+        );
+
+
+    float3 constraintPointSum =
+        float3(
+            0.0f,
+            0.0f,
+            0.0f
+        );
+
+
+    float a00 = 0.0f;
+    float a01 = 0.0f;
+    float a02 = 0.0f;
+
+    float a11 = 0.0f;
+    float a12 = 0.0f;
+
+    float a22 = 0.0f;
+
+
+    float b0 = 0.0f;
+    float b1 = 0.0f;
+    float b2 = 0.0f;
+
+
+    // ========================================================
+    // EDGES
+    // ========================================================
+
+    AccumulateConstraint(
+        p0,
+        d0,
+        p1,
+        d1,
+        cellCenter,
+
+        intersectionCount,
+        constraintCount,
+
+        intersectionSum,
+        constraintPointSum,
+
+        a00,
+        a01,
+        a02,
+
+        a11,
+        a12,
+
+        a22,
+
+        b0,
+        b1,
+        b2
+    );
+
+
+    AccumulateConstraint(
+        p0,
+        d0,
+        p2,
+        d2,
+        cellCenter,
+
+        intersectionCount,
+        constraintCount,
+
+        intersectionSum,
+        constraintPointSum,
+
+        a00,
+        a01,
+        a02,
+
+        a11,
+        a12,
+
+        a22,
+
+        b0,
+        b1,
+        b2
+    );
+
+
+    AccumulateConstraint(
+        p0,
+        d0,
+        p4,
+        d4,
+        cellCenter,
+
+        intersectionCount,
+        constraintCount,
+
+        intersectionSum,
+        constraintPointSum,
+
+        a00,
+        a01,
+        a02,
+
+        a11,
+        a12,
+
+        a22,
+
+        b0,
+        b1,
+        b2
+    );
+
+
+    AccumulateConstraint(
+        p1,
+        d1,
+        p3,
+        d3,
+        cellCenter,
+
+        intersectionCount,
+        constraintCount,
+
+        intersectionSum,
+        constraintPointSum,
+
+        a00,
+        a01,
+        a02,
+
+        a11,
+        a12,
+
+        a22,
+
+        b0,
+        b1,
+        b2
+    );
+
+
+    AccumulateConstraint(
+        p1,
+        d1,
+        p5,
+        d5,
+        cellCenter,
+
+        intersectionCount,
+        constraintCount,
+
+        intersectionSum,
+        constraintPointSum,
+
+        a00,
+        a01,
+        a02,
+
+        a11,
+        a12,
+
+        a22,
+
+        b0,
+        b1,
+        b2
+    );
+
+
+    AccumulateConstraint(
+        p2,
+        d2,
+        p3,
+        d3,
+        cellCenter,
+
+        intersectionCount,
+        constraintCount,
+
+        intersectionSum,
+        constraintPointSum,
+
+        a00,
+        a01,
+        a02,
+
+        a11,
+        a12,
+
+        a22,
+
+        b0,
+        b1,
+        b2
+    );
+
+
+    AccumulateConstraint(
+        p2,
+        d2,
+        p6,
+        d6,
+        cellCenter,
+
+        intersectionCount,
+        constraintCount,
+
+        intersectionSum,
+        constraintPointSum,
+
+        a00,
+        a01,
+        a02,
+
+        a11,
+        a12,
+
+        a22,
+
+        b0,
+        b1,
+        b2
+    );
+
+
+    AccumulateConstraint(
+        p3,
+        d3,
+        p7,
+        d7,
+        cellCenter,
+
+        intersectionCount,
+        constraintCount,
+
+        intersectionSum,
+        constraintPointSum,
+
+        a00,
+        a01,
+        a02,
+
+        a11,
+        a12,
+        a22,
+
+        b0,
+        b1,
+        b2
+    );
+
+
+    AccumulateConstraint(
+        p4,
+        d4,
+        p5,
+        d5,
+        cellCenter,
+
+        intersectionCount,
+        constraintCount,
+
+        intersectionSum,
+        constraintPointSum,
+
+        a00,
+        a01,
+        a02,
+
+        a11,
+        a12,
+
+        a22,
+
+        b0,
+        b1,
+        b2
+    );
+
+
+    AccumulateConstraint(
+        p4,
+        d4,
+        p6,
+        d6,
+        cellCenter,
+
+        intersectionCount,
+        constraintCount,
+
+        intersectionSum,
+        constraintPointSum,
+
+        a00,
+        a01,
+        a02,
+
+        a11,
+        a12,
+
+        a22,
+
+        b0,
+        b1,
+        b2
+    );
+
+
+    AccumulateConstraint(
+        p5,
+        d5,
+        p7,
+        d7,
+        cellCenter,
+
+        intersectionCount,
+        constraintCount,
+
+        intersectionSum,
+        constraintPointSum,
+
+        a00,
+        a01,
+        a02,
+
+        a11,
+        a12,
+
+        a22,
+
+        b0,
+        b1,
+        b2
+    );
+
+
+    AccumulateConstraint(
+        p6,
+        d6,
+        p7,
+        d7,
+        cellCenter,
+
+        intersectionCount,
+        constraintCount,
+
+        intersectionSum,
+        constraintPointSum,
+
+        a00,
+        a01,
+        a02,
+
+        a11,
+        a12,
+
+        a22,
+
+        b0,
+        b1,
+        b2
+    );
+
+
+    if (intersectionCount == 0)
+    {
+        return;
+    }
+
+
+    // ========================================================
+    // SOLVE QEF
+    // ========================================================
+
+    float3 vertex;
+
+
+    if (constraintCount > 0)
+    {
+        float3 localSolution;
+
+
+        bool solved =
+            SolveQEF(
+                a00,
+                a01,
+                a02,
+
+                a11,
+                a12,
+
+                a22,
+
+                b0,
+                b1,
+                b2,
+
+                localSolution
+            );
+
+
+        if (solved)
+        {
+            vertex =
+                cellCenter +
+                localSolution;
+        }
+        else
+        {
+            float3 average =
+                constraintPointSum /
+                (float) constraintCount;
+
+
+            vertex =
+                cellCenter +
+                average;
+        }
+    }
+    else
+    {
+        vertex =
+            cellCenter;
+    }
+
+
+    // ========================================================
+    // CELL BOUNDS
+    // ========================================================
+
+    float3 cellMin =
+        Origin +
+        float3(
+            x,
+            y,
+            z
+        ) *
+        Step;
+
+
+    float3 cellMax =
+        cellMin +
+        float3(
+            Step,
+            Step,
+            Step
+        );
+
+
+    bool outside =
+        vertex.x < cellMin.x ||
+        vertex.x > cellMax.x ||
+        vertex.y < cellMin.y ||
+        vertex.y > cellMax.y ||
+        vertex.z < cellMin.z ||
+        vertex.z > cellMax.z;
+
+
+    if (outside)
+    {
+        float3 averageIntersection =
+            intersectionSum /
+            (float) intersectionCount;
+
+
+        vertex =
+            averageIntersection;
+    }
+
+
+    // ========================================================
+    // NORMAL
+    //
+    // Calculate it from the FINAL vertex position.
+    // ========================================================
+
+    float3 vertexNormal =
+        EstimateNormal(
+            vertex
+        );
+
+
+    if (dot(vertexNormal, vertexNormal) < EPSILON)
+    {
+        vertexNormal =
+            float3(
+                0.0f,
+                1.0f,
+                0.0f
+            );
+    }
+    else
+    {
+        vertexNormal =
+            normalize(
+                vertexNormal
+            );
+    }
+
+
+    // ========================================================
+    // WRITE
+    // ========================================================
+
+    uint vertexIndex =
+        GetVertexIndex(
+            x,
+            y,
+            z
+        );
+
+
+    VertexBuffer[
+        vertexIndex
+    ] =
+        vertex;
+
+
+    NormalBuffer[
+        vertexIndex
+    ] =
+        vertexNormal;
+
+
+    VertexValid[
+        vertexIndex
+    ] =
+        1u;
+
+
+    InterlockedAdd(
+        VertexCountBuffer[0],
+        1u
+    );
+}
+
+
+// ============================================================
+// X FACES
+// ============================================================
+
+[numthreads(8, 8, 8)]
+void CSBuildXFaces(
+    uint3 id : SV_DispatchThreadID)
+{
+    int resolution =
+        CellCount - 1;
+
+
+    int x =
+        (int) id.x;
+
+
+    int y =
+        (int) id.y + 1;
+
+
+    int z =
+        (int) id.z + 1;
+
+
+    if (x >= resolution ||
+        y > resolution ||
+        z > resolution)
+    {
+        return;
+    }
+
+
+    float3 sampleA =
+        Origin +
+        float3(
+            x,
+            y,
+            z
+        ) *
+        Step;
+
+
+    float3 sampleB =
+        Origin +
+        float3(
+            x + 1,
+            y,
+            z
+        ) *
+        Step;
+
+
+    float da =
+        SampleDensity(
+            sampleA
+        );
+
+
+    float db =
+        SampleDensity(
+            sampleB
+        );
+
+
+    if (!IsSignChange(
+        da,
+        db))
+    {
+        return;
+    }
+
+
+    uint a =
+        GetVertexIndex(
+            x,
+            y - 1,
+            z - 1
+        );
+
+
+    uint b =
+        GetVertexIndex(
+            x,
+            y,
+            z - 1
+        );
+
+
+    uint c =
+        GetVertexIndex(
+            x,
+            y,
+            z
+        );
+
+
+    uint d =
+        GetVertexIndex(
+            x,
+            y - 1,
+            z
+        );
+
+
+    bool validA =
+        VertexValid[a] != 0u;
+
+
+    bool validB =
+        VertexValid[b] != 0u;
+
+
+    bool validC =
+        VertexValid[c] != 0u;
+
+
+    bool validD =
+        VertexValid[d] != 0u;
+
+
+    AddQuad(
+        a,
+        b,
+        c,
+        d,
+
+        validA,
+        validB,
+        validC,
+        validD,
+
+        da,
+        db,
+
+        true
+    );
+}
+
+
+// ============================================================
+// Y FACES
+// ============================================================
+
+[numthreads(8, 8, 8)]
+void CSBuildYFaces(
+    uint3 id : SV_DispatchThreadID)
+{
+    int resolution =
+        CellCount - 1;
+
+
+    int x =
+        (int) id.x + 1;
+
+
+    int y =
+        (int) id.y;
+
+
+    int z =
+        (int) id.z + 1;
+
+
+    if (x > resolution ||
+        y >= resolution ||
+        z > resolution)
+    {
+        return;
+    }
+
+
+    float3 sampleA =
+        Origin +
+        float3(
+            x,
+            y,
+            z
+        ) *
+        Step;
+
+
+    float3 sampleB =
+        Origin +
+        float3(
+            x,
+            y + 1,
+            z
+        ) *
+        Step;
+
+
+    float da =
+        SampleDensity(
+            sampleA
+        );
+
+
+    float db =
+        SampleDensity(
+            sampleB
+        );
+
+
+    if (!IsSignChange(
+        da,
+        db))
+    {
+        return;
+    }
+
+
+    uint a =
+        GetVertexIndex(
+            x - 1,
+            y,
+            z - 1
+        );
+
+
+    uint b =
+        GetVertexIndex(
+            x,
+            y,
+            z - 1
+        );
+
+
+    uint c =
+        GetVertexIndex(
+            x,
+            y,
+            z
+        );
+
+
+    uint d =
+        GetVertexIndex(
+            x - 1,
+            y,
+            z
+        );
+
+
+    bool validA =
+        VertexValid[a] != 0u;
+
+
+    bool validB =
+        VertexValid[b] != 0u;
+
+
+    bool validC =
+        VertexValid[c] != 0u;
+
+
+    bool validD =
+        VertexValid[d] != 0u;
+
+
+    AddQuad(
+        a,
+        b,
+        c,
+        d,
+
+        validA,
+        validB,
+        validC,
+        validD,
+
+        da,
+        db,
+
+        false
+    );
+}
+
+
+// ============================================================
+// Z FACES
+// ============================================================
+
+[numthreads(8, 8, 8)]
+void CSBuildZFaces(
+    uint3 id : SV_DispatchThreadID)
+{
+    int resolution =
+        CellCount - 1;
+
+
+    int x =
+        (int) id.x + 1;
+
+
+    int y =
+        (int) id.y + 1;
+
+
+    int z =
+        (int) id.z;
+
+
+    if (x > resolution ||
+        y > resolution ||
+        z >= resolution)
+    {
+        return;
+    }
+
+
+    float3 sampleA =
+        Origin +
+        float3(
+            x,
+            y,
+            z
+        ) *
+        Step;
+
+
+    float3 sampleB =
+        Origin +
+        float3(
+            x,
+            y,
+            z + 1
+        ) *
+        Step;
+
+
+    float da =
+        SampleDensity(
+            sampleA
+        );
+
+
+    float db =
+        SampleDensity(
+            sampleB
+        );
+
+
+    if (!IsSignChange(
+        da,
+        db))
+    {
+        return;
+    }
+
+
+    uint a =
+        GetVertexIndex(
+            x - 1,
+            y - 1,
+            z
+        );
+
+
+    uint b =
+        GetVertexIndex(
+            x,
+            y - 1,
+            z
+        );
+
+
+    uint c =
+        GetVertexIndex(
+            x,
+            y,
+            z
+        );
+
+
+    uint d =
+        GetVertexIndex(
+            x - 1,
+            y,
+            z
+        );
+
+
+    bool validA =
+        VertexValid[a] != 0u;
+
+
+    bool validB =
+        VertexValid[b] != 0u;
+
+
+    bool validC =
+        VertexValid[c] != 0u;
+
+
+    bool validD =
+        VertexValid[d] != 0u;
+
+
+    AddQuad(
+        a,
+        b,
+        c,
+        d,
+
+        validA,
+        validB,
+        validC,
+        validD,
+
+        da,
+        db,
+
+        true
+    );
+}
